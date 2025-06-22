@@ -51,10 +51,14 @@ usb_tcp_remote_find_inflight_packet(USBTCPRemoteState *s, int pid, uint8_t ep,
 {
     USBTCPInflightPacket *p;
 
+    if (!s) {
+        return NULL;
+    }
+
     QEMU_LOCK_GUARD(&s->queue_mutex);
 
     QTAILQ_FOREACH (p, &s->queue, queue) {
-        if (p->p->pid == pid && p->p->ep->nr == ep && p->p->id == id) {
+        if (p && p->p && p->p->pid == pid && p->p->ep && p->p->ep->nr == ep && p->p->id == id) {
             return p;
         }
     }
@@ -184,14 +188,14 @@ static int usb_tcp_remote_read(USBTCPRemoteState *s, void *buffer,
     int ret = 0;
     int n = 0;
     bool locked = bql_locked();
-    if (locked) {
+    if (locked && !qemu_in_coroutine()) {
         bql_unlock();
     }
 
     while (n < length) {
         ret = read(s->fd, (char *)buffer + n, length - n);
         if (ret <= 0) {
-            if (locked) {
+            if (locked && !qemu_in_coroutine()) {
                 bql_lock();
             }
             usb_tcp_remote_closed(s);
@@ -201,7 +205,7 @@ static int usb_tcp_remote_read(USBTCPRemoteState *s, void *buffer,
         n += ret;
     }
 
-    if (locked) {
+    if (locked && !qemu_in_coroutine()) {
         bql_lock();
     }
 
@@ -213,15 +217,26 @@ static int usb_tcp_remote_write(USBTCPRemoteState *s, void *buffer,
 {
     int ret = 0;
     int n = 0;
+    bool locked = bql_locked();
+    if (locked && !qemu_in_coroutine()) {
+        bql_unlock();
+    }
 
     while (n < length) {
         ret = write(s->fd, (char *)buffer + n, length - n);
         if (ret <= 0) {
+            if (locked && !qemu_in_coroutine()) {
+                bql_lock();
+            }
             usb_tcp_remote_closed(s);
             return -errno;
         }
 
         n += ret;
+    }
+
+    if (locked && !qemu_in_coroutine()) {
+        bql_lock();
     }
 
     return n;
@@ -243,6 +258,12 @@ static bool usb_tcp_remote_read_one(USBTCPRemoteState *s)
         bool cancelled = false;
 
         if (usb_tcp_remote_read(s, &rhdr, sizeof(rhdr)) < sizeof(rhdr)) {
+            return false;
+        }
+
+        if (rhdr.length > 65536) {  // Reasonable max packet size
+            warn_report("%s: TCP_USB_RESPONSE invalid length: %d\n", 
+                       __func__, rhdr.length);
             return false;
         }
 
@@ -344,11 +365,16 @@ static void *usb_tcp_remote_read_thread(void *opaque)
 {
     USBTCPRemoteState *s = USB_TCP_REMOTE(opaque);
 
-    bql_lock();
+    if (!bql_locked() && !qemu_in_coroutine()) {
+        bql_lock();
+    }
+    
     while (usb_tcp_remote_read_one(s) && !s->closed) {
         continue;
     }
-    bql_unlock();
+    if (bql_locked() && !qemu_in_coroutine()) {
+        bql_unlock();
+    }
 
     return NULL;
 }
@@ -374,9 +400,11 @@ static void *usb_tcp_remote_thread(void *arg)
 
             DPRINTF("%s: USB device accepted!\n", __func__);
 
-            bql_lock();
-            usb_device_attach(USB_DEVICE(s), &error_abort);
-            bql_unlock();
+            if (USB_DEVICE(s) && !USB_DEVICE(s)->attached) {
+                bql_lock();
+                usb_device_attach(USB_DEVICE(s), &error_abort);
+                bql_unlock();
+            }
             qemu_thread_create(&s->read_thread, TYPE_USB_TCP_REMOTE ".read",
                                usb_tcp_remote_read_thread, s,
                                QEMU_THREAD_JOINABLE);
